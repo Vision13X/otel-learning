@@ -1,0 +1,30 @@
+# Secrets - never commit these
+.env
+*.pem
+*.key
+credentials
+*_credentials*
+*_secret*
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+!*.tfvars.example
+
+# OS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+!.vscode/settings.json
+*.swp
+*.swo
+
+# Kiro
+.kiro/settings/
+
+# Logs
+*.log

@@ -87,9 +87,16 @@ otel-learning/ ├── docs/ │ ├── ARCHITECTURE.md │ ├── DECIS
 Once in the workspace, set up `.kiro/steering/` with project conventions so Kiro maintains consistency across sessions.
 
 ## Current Status
-- [ ] Milestone 1: Not started
+- [x] Milestone 1: Complete (repo scaffolded, IAM users created, secrets stored)
 - [ ] Milestone 2: Not started
-- [ ] ...
+- [ ] Milestone 3: Not started
+- [ ] Milestone 4: Not started
+- [ ] Milestone 5: Not started
+- [ ] Milestone 6: Not started
+- [ ] Milestone 7: Not started
+- [ ] Milestone 8: Not started
+- [ ] Milestone 9: Not started
+- [ ] Milestone 10: Not started
 
 ## Next Action
-Start Milestone 1: Create repo structure, create IAM user, install AWS CLI, configure credentials.
+Start Milestone 2: Launch EC2 instance, install Docker, deploy OTel Demo via Docker Compose.
