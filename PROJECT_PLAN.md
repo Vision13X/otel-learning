@@ -53,7 +53,7 @@ Compress a week of learning (Prometheus, OpenTelemetry, Grafana, K8s, CI/CD) int
 - Deploy EKS cluster
 - Migrate OTel Demo from Docker Compose to Helm on EKS
 - Understand: K8s concepts, why orchestration exists, Helm, service discovery
-
+1   @ 
 ### Milestone 6: IaC — Terraform for Everything
 - Codify what was built manually (VPC, EC2, EKS, IAM)
 - Understand: state management, modules, plan/apply, drift detection
@@ -89,7 +89,8 @@ Once in the workspace, set up `.kiro/steering/` with project conventions so Kiro
 ## Current Status
 - [x] Milestone 1: Complete (repo scaffolded, IAM users created, secrets stored)
 - [x] Milestone 2: Complete (EC2 + Docker Compose running, observability stack live)
-- [ ] Milestone 3: Not started
+- [x] Milestone 3: Complete (Prometheus, Grafana, Jaeger, tracing, dashboard design, instrumentation)
+- [x] Milestone 4: In Progress (EKS deploy + destroy pipelines written)
 - [ ] Milestone 4: Not started
 - [ ] Milestone 5: Not started
 - [ ] Milestone 6: Not started

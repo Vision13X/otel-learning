@@ -1,0 +1,150 @@
+# Deploy EKS Cluster + OTel Demo
+# Trigger: manual (workflow_dispatch) or push to main
+# What it does:
+#   1. Creates an EKS cluster with 2 nodes (if it doesn't exist)
+#   2. Installs the OTel Demo via Helm
+#   3. Outputs access URLs for Grafana, Jaeger, frontend
+#
+# Time: ~18-25 min (EKS cluster creation is the bottleneck)
+# Cost: ~$0.10/hr control plane + ~$0.08/hr per node (2 nodes)
+
+name: Deploy OTel Demo to EKS
+
+on:
+  workflow_dispatch:  # Manual trigger from GitHub UI
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/deploy.yml'
+      - 'k8s/**'
+
+env:
+  CLUSTER_NAME: otel-learning
+  REGION: us-east-1
+  NODE_INSTANCE_TYPE: t3.large
+  NODE_COUNT: 2
+  NAMESPACE: otel-demo
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # Step 1: Check out the repo so we have access to our files
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Step 2: Configure AWS credentials from GitHub Secrets
+      # This is how the pipeline authenticates with AWS — using the
+      # kiro-deploy IAM user's access keys stored in GitHub Secrets.
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Step 3: Install eksctl — CLI tool that creates/manages EKS clusters.
+      # eksctl abstracts ~15 CloudFormation stacks into one command.
+      # It creates: VPC, subnets, NAT gateway, IAM roles, node groups, security groups.
+      - name: Install eksctl
+        run: |
+          ARCH=amd64
+          PLATFORM=$(uname -s)_$ARCH
+          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$PLATFORM.tar.gz"
+          tar -xzf eksctl_$PLATFORM.tar.gz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin
+
+      # Step 4: Install kubectl — CLI to interact with Kubernetes
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      # Step 5: Install Helm — Kubernetes package manager.
+      # Helm charts are like docker-compose files for K8s — they define
+      # all the resources (pods, services, config) for an application.
+      - name: Install Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      # Step 6: Create or reuse EKS cluster
+      # eksctl checks if the cluster exists first. If it does, skip creation.
+      # If not, it creates everything from scratch (~15-20 min).
+      #
+      # What eksctl creates under the hood:
+      #   - VPC with public + private subnets across 2 AZs
+      #   - Internet Gateway + NAT Gateway
+      #   - EKS control plane (managed by AWS — you never see these servers)
+      #   - Node group: 2x t3.large EC2 instances that run your containers
+      #   - IAM roles for the control plane and nodes
+      #   - Security groups for inter-node and control-plane communication
+      - name: Create EKS cluster
+        run: |
+          if eksctl get cluster --name $CLUSTER_NAME --region $REGION 2>/dev/null; then
+            echo "Cluster $CLUSTER_NAME already exists, skipping creation"
+          else
+            eksctl create cluster \
+              --name $CLUSTER_NAME \
+              --region $REGION \
+              --node-type $NODE_INSTANCE_TYPE \
+              --nodes $NODE_COUNT \
+              --managed \
+              --with-oidc
+          fi
+
+      # Step 7: Update kubeconfig so kubectl can talk to the cluster
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region $REGION
+
+      # Step 8: Verify cluster is accessible
+      - name: Verify cluster
+        run: |
+          kubectl get nodes
+          kubectl cluster-info
+
+      # Step 9: Create namespace for OTel Demo
+      # Namespaces are logical boundaries in K8s — like folders.
+      # Keeps our demo resources separate from system resources.
+      - name: Create namespace
+        run: |
+          kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+
+      # Step 10: Add the OpenTelemetry Helm repo and install the demo
+      # This is the equivalent of our docker-compose but for Kubernetes.
+      # The Helm chart defines all 15 services + collector + Prometheus + Grafana
+      # as Kubernetes resources (Deployments, Services, ConfigMaps, etc.)
+      - name: Install OTel Demo via Helm
+        run: |
+          helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+          helm repo update
+          helm upgrade --install otel-demo open-telemetry/opentelemetry-demo \
+            --namespace $NAMESPACE \
+            --set components.frontendProxy.service.type=LoadBalancer \
+            --timeout 10m \
+            --wait
+
+      # Step 11: Get the LoadBalancer URL (how you access the demo from your browser)
+      # In K8s, a LoadBalancer service type provisions an AWS ELB automatically.
+      # This is the equivalent of our EC2 public IP but managed and stable.
+      - name: Get access URLs
+        run: |
+          echo "Waiting for LoadBalancer to be assigned..."
+          sleep 30
+          FRONTEND_URL=$(kubectl get svc otel-demo-frontendproxy -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "============================================"
+          echo "OTel Demo Frontend: http://$FRONTEND_URL:8080"
+          echo "Grafana:            http://$FRONTEND_URL:8080/grafana/"
+          echo "Jaeger:             http://$FRONTEND_URL:8080/jaeger/ui"
+          echo "============================================"
+          echo "FRONTEND_URL=$FRONTEND_URL" >> $GITHUB_ENV
+
+      # Step 12: Verify pods are running
+      - name: Verify deployment
+        run: |
+          echo "Checking pod status..."
+          kubectl get pods -n $NAMESPACE
+          echo ""
+          echo "Checking services..."
+          kubectl get svc -n $NAMESPACE
