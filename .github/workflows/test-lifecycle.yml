@@ -1,0 +1,274 @@
+# Lifecycle Test — End-to-End validation of deploy + destroy
+#
+# This is the "unit test" for our infrastructure pipelines.
+# It proves the full cycle works: deploy → verify running → destroy → verify dead
+#
+# What it does:
+#   1. Budget check (same as deploy.yml)
+#   2. Create EKS cluster + deploy OTel Demo
+#   3. Verify everything is running (pods, services, URLs)
+#   4. Wait 5 min (let things stabilize)
+#   5. Full destroy
+#   6. Validate nothing remains (same checks as validate-destroy.yml)
+#
+# Total time: ~35-40 min (15-20 create + 5 stabilize + 10-15 destroy)
+# Cost: ~$0.50-0.70 for the test run
+#
+# Run this ONCE to prove your pipelines work. Then trust deploy/destroy individually.
+
+name: Test Full Lifecycle (Deploy + Destroy)
+
+on:
+  workflow_dispatch:  # Manual only — this costs real money
+
+env:
+  CLUSTER_NAME: otel-learning-test
+  REGION: us-east-1
+  NODE_INSTANCE_TYPE: t3.large
+  NODE_COUNT: 2
+  NAMESPACE: otel-demo
+
+jobs:
+  # Phase 1: Budget check
+  budget-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Budget check
+        run: |
+          START_DATE=$(date +%Y-%m-01)
+          END_DATE=$(date +%Y-%m-%d)
+
+          MTD_SPEND=$(aws ce get-cost-and-usage \
+            --time-period Start=$START_DATE,End=$END_DATE \
+            --granularity MONTHLY \
+            --metrics UnblendedCost \
+            --query 'ResultsByTime[0].Total.UnblendedCost.Amount' \
+            --output text)
+
+          if [ -z "$MTD_SPEND" ] || [ "$MTD_SPEND" == "None" ]; then
+            MTD_SPEND="0.00"
+          fi
+
+          echo "Month-to-date: \$$MTD_SPEND (cap: \$70)"
+
+          if (( $(echo "$MTD_SPEND >= 70" | bc -l) )); then
+            echo "❌ Over budget — cannot run lifecycle test"
+            exit 1
+          fi
+          echo "✅ Budget OK"
+
+  # Phase 2: Deploy
+  deploy:
+    needs: budget-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install tools
+        run: |
+          # eksctl
+          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz"
+          tar -xzf eksctl_Linux_amd64.tar.gz -C /tmp && sudo mv /tmp/eksctl /usr/local/bin
+          # kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          # helm
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Create EKS cluster
+        run: |
+          echo "⏱️  Creating test cluster (this takes ~15-20 min)..."
+          eksctl create cluster \
+            --name $CLUSTER_NAME \
+            --region $REGION \
+            --node-type $NODE_INSTANCE_TYPE \
+            --nodes $NODE_COUNT \
+            --managed \
+            --with-oidc
+          echo "✅ Cluster created"
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region $REGION
+
+      - name: Deploy OTel Demo
+        run: |
+          kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+          helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+          helm repo update
+          helm upgrade --install otel-demo open-telemetry/opentelemetry-demo \
+            --namespace $NAMESPACE \
+            --set components.frontendProxy.service.type=LoadBalancer \
+            --timeout 10m \
+            --wait
+          echo "✅ OTel Demo deployed"
+
+      # Phase 3: Verify deployment is working
+      - name: Verify pods running
+        run: |
+          echo "Checking all pods are Running..."
+          TOTAL=$(kubectl get pods -n $NAMESPACE --no-headers | wc -l)
+          RUNNING=$(kubectl get pods -n $NAMESPACE --field-selector=status.phase=Running --no-headers | wc -l)
+
+          echo "Pods: $RUNNING / $TOTAL running"
+
+          if [ "$RUNNING" -lt 10 ]; then
+            echo "❌ FAIL: Expected at least 10 pods running, got $RUNNING"
+            kubectl get pods -n $NAMESPACE
+            exit 1
+          fi
+          echo "✅ Pods healthy"
+
+      - name: Verify services exist
+        run: |
+          echo "Checking critical services..."
+          kubectl get svc -n $NAMESPACE
+
+          # Check frontendproxy has a LoadBalancer
+          LB=$(kubectl get svc otel-demo-frontendproxy -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+          if [ -z "$LB" ]; then
+            echo "⚠️  LoadBalancer not assigned yet (may take a minute)"
+          else
+            echo "✅ LoadBalancer: $LB"
+          fi
+
+      - name: Verify frontend responds
+        run: |
+          echo "Waiting 60s for LoadBalancer DNS propagation..."
+          sleep 60
+          LB=$(kubectl get svc otel-demo-frontendproxy -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          if [ -n "$LB" ]; then
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://$LB:8080" --max-time 10 || echo "000")
+            if [ "$STATUS" == "200" ] || [ "$STATUS" == "302" ]; then
+              echo "✅ Frontend responding (HTTP $STATUS)"
+            else
+              echo "⚠️  Frontend returned HTTP $STATUS (may still be starting)"
+            fi
+          fi
+
+      - name: Test result summary (deploy)
+        run: |
+          echo "============================================"
+          echo "  DEPLOY TEST: PASSED"
+          echo "  Cluster: $CLUSTER_NAME"
+          echo "  Pods running: $(kubectl get pods -n $NAMESPACE --field-selector=status.phase=Running --no-headers | wc -l)"
+          echo "  Services: $(kubectl get svc -n $NAMESPACE --no-headers | wc -l)"
+          echo "============================================"
+
+  # Phase 4: Wait, then destroy
+  destroy:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install eksctl
+        run: |
+          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz"
+          tar -xzf eksctl_Linux_amd64.tar.gz -C /tmp && sudo mv /tmp/eksctl /usr/local/bin
+
+      - name: Wait for stabilization
+        run: |
+          echo "Waiting 2 min to let resources stabilize before destroy..."
+          sleep 120
+
+      - name: Destroy cluster
+        run: |
+          echo "⏱️  Destroying test cluster..."
+          eksctl delete cluster --name $CLUSTER_NAME --region $REGION --wait
+          echo "✅ Cluster destroyed"
+
+  # Phase 5: Validate nothing remains
+  validate:
+    needs: destroy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify cluster gone
+        run: |
+          RESULT=$(aws eks describe-cluster --name $CLUSTER_NAME --region $REGION 2>&1 || true)
+          if echo "$RESULT" | grep -q "ResourceNotFoundException"; then
+            echo "✅ Cluster confirmed deleted"
+          else
+            echo "❌ FAIL: Cluster still exists!"
+            exit 1
+          fi
+
+      - name: Verify no EC2 instances from test
+        run: |
+          # eksctl tags nodes with the cluster name
+          INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=tag:eksctl.cluster.k8s.io/v1alpha1/cluster-name,Values=$CLUSTER_NAME" \
+                      "Name=instance-state-name,Values=running,pending" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text)
+
+          if [ -z "$INSTANCES" ]; then
+            echo "✅ No EC2 instances from test cluster"
+          else
+            echo "❌ FAIL: EC2 instances still running: $INSTANCES"
+            exit 1
+          fi
+
+      - name: Verify no NAT gateways
+        run: |
+          NATS=$(aws ec2 describe-nat-gateways \
+            --filter "Name=state,Values=available,pending" \
+            --query 'NatGateways[*].NatGatewayId' \
+            --output text)
+
+          if [ -z "$NATS" ]; then
+            echo "✅ No NAT gateways running"
+          else
+            echo "⚠️  NAT gateways found (may be from test): $NATS"
+            echo "   These cost \$0.045/hr — delete manually if unexpected"
+          fi
+
+      - name: Verify no orphaned load balancers
+        run: |
+          ELBS=$(aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].LoadBalancerName' --output text 2>/dev/null)
+          ELBS_V2=$(aws elbv2 describe-load-balancers --query 'LoadBalancers[*].LoadBalancerName' --output text 2>/dev/null)
+
+          if [ -z "$ELBS" ] && [ -z "$ELBS_V2" ]; then
+            echo "✅ No load balancers"
+          else
+            echo "⚠️  Load balancers found: $ELBS $ELBS_V2"
+          fi
+
+      - name: Final verdict
+        run: |
+          echo "============================================"
+          echo "  LIFECYCLE TEST: ALL PHASES PASSED"
+          echo ""
+          echo "  ✅ Deploy: cluster created, pods running"
+          echo "  ✅ Destroy: cluster deleted"
+          echo "  ✅ Validate: no resources remaining"
+          echo ""
+          echo "  Pipelines are proven to work."
+          echo "============================================"

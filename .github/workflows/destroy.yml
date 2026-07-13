@@ -1,22 +1,15 @@
-# Destroy EKS Cluster + All Resources
-# Trigger: manual only (you don't accidentally destroy things)
-# What it does:
-#   1. Deletes the Helm release (OTel Demo)
-#   2. Deletes the EKS cluster (and all associated CloudFormation stacks)
-#   3. Cleans up the LoadBalancer (AWS ELB)
-#
-# Time: ~10-15 min (CloudFormation stack deletion)
-# After this: $0 cost. Nothing running.
+# Manual Destroy — use this if you want to tear down mid-day
+# The nightly cron (cost-control.yml) handles automatic destroy at 1 AM UTC.
+# This is for "I'm done for the day early" or "something went wrong, kill it all."
 
-name: Destroy OTel Demo + EKS
+name: Destroy EKS (Manual)
 
 on:
-  workflow_dispatch:  # Manual trigger only — never automatic
+  workflow_dispatch:  # Manual trigger only
 
 env:
   CLUSTER_NAME: otel-learning
   REGION: us-east-1
-  NAMESPACE: otel-demo
 
 jobs:
   destroy:
@@ -37,41 +30,12 @@ jobs:
           tar -xzf eksctl_$PLATFORM.tar.gz -C /tmp
           sudo mv /tmp/eksctl /usr/local/bin
 
-      - name: Install kubectl
+      - name: Destroy cluster
         run: |
-          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/
-
-      - name: Install Helm
-        run: |
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-
-      # Connect to the cluster before deleting resources inside it
-      - name: Update kubeconfig
-        run: |
-          aws eks update-kubeconfig --name $CLUSTER_NAME --region $REGION
-
-      # Step 1: Uninstall Helm release first
-      # This removes all K8s resources (pods, services, configmaps) cleanly.
-      # Important to do BEFORE deleting the cluster — otherwise the LoadBalancer
-      # (AWS ELB) gets orphaned and keeps costing money.
-      - name: Uninstall OTel Demo
-        run: |
-          helm uninstall otel-demo --namespace $NAMESPACE || echo "Release not found, skipping"
-
-      # Step 2: Wait for LoadBalancer cleanup
-      # When Helm removes the LoadBalancer service, AWS needs time to
-      # deprovision the ELB. If we delete the cluster too fast, the ELB
-      # gets orphaned (still running, still billing).
-      - name: Wait for LB cleanup
-        run: |
-          echo "Waiting 60s for AWS to clean up LoadBalancer..."
-          sleep 60
-
-      # Step 3: Delete the entire cluster
-      # eksctl deletes everything it created: node group, VPC, subnets,
-      # NAT gateway, IAM roles, security groups — all via CloudFormation.
-      - name: Delete EKS cluster
-        run: |
-          eksctl delete cluster --name $CLUSTER_NAME --region $REGION --wait
+          if eksctl get cluster --name $CLUSTER_NAME --region $REGION 2>/dev/null; then
+            echo "Destroying cluster $CLUSTER_NAME..."
+            eksctl delete cluster --name $CLUSTER_NAME --region $REGION --wait
+            echo "✅ Done. Cost is now $0/hr."
+          else
+            echo "Cluster doesn't exist. Nothing to destroy."
+          fi

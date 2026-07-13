@@ -1,0 +1,158 @@
+# Validate Destroy — Confirms no resources are running after destroy
+#
+# Run this AFTER a destroy workflow completes to verify nothing is still alive.
+# This is your "trust but verify" — proves the nightly/manual destroy actually worked.
+#
+# Checks:
+#   - No EKS cluster exists
+#   - No EC2 instances tagged with our project are running
+#   - No ELBs (load balancers) are lingering
+#   - No NAT gateways are lingering (these cost $0.045/hr each!)
+#
+# If ANY check finds living resources, the workflow FAILS and tells you what's still alive.
+
+name: Validate Destroy (Verify $0 Cost)
+
+on:
+  workflow_dispatch:  # Manual trigger
+  # Also run automatically 30 min after nightly destroy
+  schedule:
+    - cron: '30 1 * * *'
+
+env:
+  CLUSTER_NAME: otel-learning
+  REGION: us-east-1
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Check for EKS cluster
+        id: eks
+        run: |
+          CLUSTER=$(aws eks describe-cluster --name $CLUSTER_NAME --region $REGION 2>&1 || true)
+          if echo "$CLUSTER" | grep -q "ResourceNotFoundException"; then
+            echo "✅ No EKS cluster found"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "❌ EKS cluster '$CLUSTER_NAME' STILL EXISTS"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check for running EC2 instances
+        id: ec2
+        run: |
+          INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=instance-state-name,Values=running,pending" \
+            --query 'Reservations[*].Instances[*].[InstanceId,Tags[?Key==`Name`].Value|[0]]' \
+            --output text)
+
+          if [ -z "$INSTANCES" ]; then
+            echo "✅ No running EC2 instances"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "❌ RUNNING EC2 INSTANCES FOUND:"
+            echo "$INSTANCES"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check for load balancers
+        id: elb
+        run: |
+          # Classic ELBs
+          CLASSIC=$(aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].LoadBalancerName' --output text 2>/dev/null)
+          # ALBs/NLBs
+          V2=$(aws elbv2 describe-load-balancers --query 'LoadBalancers[*].[LoadBalancerName,State.Code]' --output text 2>/dev/null)
+
+          FOUND=false
+          if [ -n "$CLASSIC" ]; then
+            echo "❌ CLASSIC LOAD BALANCERS FOUND:"
+            echo "$CLASSIC"
+            FOUND=true
+          fi
+          if [ -n "$V2" ]; then
+            echo "❌ ALB/NLB LOAD BALANCERS FOUND:"
+            echo "$V2"
+            FOUND=true
+          fi
+
+          if [ "$FOUND" == "false" ]; then
+            echo "✅ No load balancers found"
+          fi
+          echo "exists=$FOUND" >> $GITHUB_OUTPUT
+
+      - name: Check for NAT gateways
+        id: nat
+        run: |
+          NATS=$(aws ec2 describe-nat-gateways \
+            --filter "Name=state,Values=available,pending" \
+            --query 'NatGateways[*].[NatGatewayId,State]' \
+            --output text)
+
+          if [ -z "$NATS" ]; then
+            echo "✅ No active NAT gateways"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "❌ NAT GATEWAYS STILL RUNNING (these cost \$0.045/hr each!):"
+            echo "$NATS"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check for EBS volumes (non-default)
+        id: ebs
+        run: |
+          # Only flag volumes that are "available" (not attached) — these are orphaned and wasting money
+          VOLUMES=$(aws ec2 describe-volumes \
+            --filters "Name=status,Values=available" \
+            --query 'Volumes[*].[VolumeId,Size,CreateTime]' \
+            --output text)
+
+          if [ -z "$VOLUMES" ]; then
+            echo "✅ No orphaned EBS volumes"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️  Orphaned EBS volumes (not attached, costing money):"
+            echo "$VOLUMES"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          fi
+
+      # Final verdict
+      - name: Final validation
+        run: |
+          FAILED=false
+
+          if [ "${{ steps.eks.outputs.exists }}" == "true" ]; then
+            echo "FAIL: EKS cluster still exists"
+            FAILED=true
+          fi
+          if [ "${{ steps.ec2.outputs.exists }}" == "true" ]; then
+            echo "FAIL: EC2 instances still running"
+            FAILED=true
+          fi
+          if [ "${{ steps.elb.outputs.exists }}" == "true" ]; then
+            echo "FAIL: Load balancers still exist"
+            FAILED=true
+          fi
+          if [ "${{ steps.nat.outputs.exists }}" == "true" ]; then
+            echo "FAIL: NAT gateways still running"
+            FAILED=true
+          fi
+
+          if [ "$FAILED" == "true" ]; then
+            echo ""
+            echo "❌ DESTROY VALIDATION FAILED — resources still alive and costing money!"
+            exit 1
+          fi
+
+          echo ""
+          echo "============================================"
+          echo "✅ ALL CLEAR — no billable resources found"
+          echo "   Current cost rate: \$0/hr"
+          echo "============================================"

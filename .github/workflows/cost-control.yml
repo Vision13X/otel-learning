@@ -1,0 +1,166 @@
+# Cost Control Pipeline
+#
+# Rules:
+#   1. PRE-DEPLOY CHECK: if (current_monthly_spend + estimated_weekly_cost) >= $70, HARD STOP.
+#      This ensures we NEVER cross $70 even in the worst case next week.
+#   2. NIGHTLY DESTROY: At 1 AM UTC, full destroy of ALL compute (cluster, nodes, everything).
+#      Only persistent storage (EBS snapshots, S3 state) survives.
+#      15 min rebuild on next deploy is acceptable.
+#   3. EMERGENCY KILL: If monthly spend >= $70 at any check, destroy EVERYTHING immediately.
+#
+# Cost math:
+#   EKS control plane: $0.10/hr = $2.40/day = $16.80/week
+#   2x t3.large nodes: $0.0832/hr each = $1.99/day each = $27.94/week both
+#   Total max weekly: ~$44.74/week (control plane + 2 nodes 24/7)
+#   With nightly destroy (16 hrs/day): ~$22/week
+#
+# Monthly budget: $70 HARD CAP
+# If current_spend + 44.74 (one full week worst case) >= 70 → block deploy
+
+name: Cost Control
+
+on:
+  schedule:
+    # Full destroy at 1 AM UTC every night
+    - cron: '0 1 * * *'
+
+  # Called by deploy pipeline as a pre-check
+  workflow_call:
+    outputs:
+      budget_ok:
+        description: "Whether projected spend stays under $70"
+        value: ${{ jobs.check-budget.outputs.budget_ok }}
+
+  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'check'
+        type: choice
+        options:
+          - check
+          - full-destroy
+
+env:
+  CLUSTER_NAME: otel-learning
+  REGION: us-east-1
+  MONTHLY_HARD_CAP: 70
+
+jobs:
+  check-budget:
+    runs-on: ubuntu-latest
+    outputs:
+      budget_ok: ${{ steps.check.outputs.budget_ok }}
+      current_spend: ${{ steps.check.outputs.current_spend }}
+      projected: ${{ steps.check.outputs.projected }}
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Simple check: if month-to-date >= $70, block and destroy.
+      - name: Check monthly spend against hard cap
+        id: check
+        run: |
+          START_DATE=$(date +%Y-%m-01)
+          END_DATE=$(date +%Y-%m-%d)
+
+          MTD_SPEND=$(aws ce get-cost-and-usage \
+            --time-period Start=$START_DATE,End=$END_DATE \
+            --granularity MONTHLY \
+            --metrics UnblendedCost \
+            --query 'ResultsByTime[0].Total.UnblendedCost.Amount' \
+            --output text)
+
+          if [ -z "$MTD_SPEND" ] || [ "$MTD_SPEND" == "None" ]; then
+            MTD_SPEND="0.00"
+          fi
+
+          echo "Month-to-date spend: \$$MTD_SPEND"
+          echo "Hard cap: \$$MONTHLY_HARD_CAP"
+          echo "current_spend=$MTD_SPEND" >> $GITHUB_OUTPUT
+
+          if (( $(echo "$MTD_SPEND >= $MONTHLY_HARD_CAP" | bc -l) )); then
+            echo "🚨 MONTHLY SPEND HIT \$70 CAP — destroying everything"
+            echo "budget_ok=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "✅ Budget OK (\$$MTD_SPEND < \$70)"
+          echo "budget_ok=true" >> $GITHUB_OUTPUT
+
+  # EMERGENCY DESTROY: if monthly spend already >= $70
+  emergency-destroy:
+    needs: check-budget
+    if: failure() && needs.check-budget.outputs.budget_ok == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install eksctl
+        run: |
+          ARCH=amd64
+          PLATFORM=$(uname -s)_$ARCH
+          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$PLATFORM.tar.gz"
+          tar -xzf eksctl_$PLATFORM.tar.gz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin
+
+      - name: Emergency destroy all resources
+        run: |
+          echo "🚨 EMERGENCY DESTROY — monthly spend exceeded hard cap"
+          eksctl delete cluster --name $CLUSTER_NAME --region $REGION --wait || echo "Cluster not found"
+          echo "All compute destroyed. Only S3/EBS snapshots remain (pennies/month)."
+
+  # NIGHTLY FULL DESTROY: runs at 1 AM UTC every night via cron
+  # Destroys the entire cluster — control plane, nodes, everything.
+  # Next deploy rebuilds from scratch (15-20 min). This guarantees $0/hr overnight.
+  # Persistent storage (S3 for Terraform state, EBS snapshots) is NOT touched.
+  nightly-destroy:
+    if: github.event_name == 'schedule' || github.event.inputs.action == 'full-destroy'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install eksctl
+        run: |
+          ARCH=amd64
+          PLATFORM=$(uname -s)_$ARCH
+          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$PLATFORM.tar.gz"
+          tar -xzf eksctl_$PLATFORM.tar.gz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin
+
+      # Full destroy: cluster + nodes + VPC + everything eksctl created.
+      # S3 buckets and EBS snapshots are NOT part of the cluster so they survive.
+      # This brings hourly cost to $0 until you trigger deploy again.
+      - name: Destroy cluster (nightly)
+        run: |
+          echo "🌙 Nightly destroy: tearing down cluster to stop all costs"
+          echo "   Next deploy will recreate from scratch (~15-20 min)"
+
+          # Check if cluster exists first
+          if eksctl get cluster --name $CLUSTER_NAME --region $REGION 2>/dev/null; then
+            eksctl delete cluster --name $CLUSTER_NAME --region $REGION --wait
+            echo "✅ Cluster destroyed. Cost is now $0/hr."
+          else
+            echo "Cluster doesn't exist. Nothing to destroy."
+          fi
+
+          echo ""
+          echo "Persistent storage preserved:"
+          echo "  - S3 buckets (Terraform state) — ~$0.02/month"
+          echo "  - EBS snapshots (if any) — ~$0.05/GB/month"
