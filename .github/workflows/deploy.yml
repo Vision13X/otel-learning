@@ -1,13 +1,12 @@
 # Deploy EKS Cluster + OTel Demo
-# Trigger: manual (workflow_dispatch) or push to main
-# What it does:
-#   1. Checks budget (blocks if projected monthly spend + worst-case week >= $70)
-#   2. Creates EKS cluster from scratch (nightly destroy means no cluster exists in morning)
-#   3. Installs the OTel Demo via Helm
-#   4. Outputs access URLs
 #
-# Time: ~18-25 min (EKS cluster creation is the bottleneck — "pee time + beverage")
-# Cost: ~$0.10/hr control plane + ~$0.08/hr per node (2 nodes)
+# ALL cost/budget/orphan validation lives in cost-control.yml.
+# This workflow ONLY deploys. It calls cost-control first as a gate.
+#
+# Flow: cost-control (validate) → deploy (create + install)
+#
+# Time: ~18-25 min (EKS creation is the bottleneck)
+# Cost: determined by cost-control.yml from live AWS pricing
 
 name: Deploy OTel Demo to EKS
 
@@ -27,47 +26,20 @@ env:
   NAMESPACE: otel-demo
 
 jobs:
-  # Gate: check budget before spending a dime
-  cost-check:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      # Logic: if month-to-date spend >= $70, block. That's it.
-      # Nightly destroy ensures we can't silently accumulate.
-      - name: Budget gate
-        run: |
-          START_DATE=$(date +%Y-%m-01)
-          END_DATE=$(date +%Y-%m-%d)
-
-          MTD_SPEND=$(aws ce get-cost-and-usage \
-            --time-period Start=$START_DATE,End=$END_DATE \
-            --granularity MONTHLY \
-            --metrics UnblendedCost \
-            --query 'ResultsByTime[0].Total.UnblendedCost.Amount' \
-            --output text)
-
-          if [ -z "$MTD_SPEND" ] || [ "$MTD_SPEND" == "None" ]; then
-            MTD_SPEND="0.00"
-          fi
-
-          echo "Month-to-date spend: \$$MTD_SPEND"
-          echo "Hard cap: \$70"
-
-          if (( $(echo "$MTD_SPEND >= 70" | bc -l) )); then
-            echo "❌ DEPLOY BLOCKED: monthly spend \$$MTD_SPEND has hit the \$70 cap"
-            exit 1
-          fi
-
-          echo "✅ Budget OK (\$$MTD_SPEND < \$70) — proceeding with deploy"
+  # Gate: cost-control does ALL validation
+  # - Orphan check (nightly destroy failed?)
+  # - Live pricing from AWS Pricing API
+  # - Budget projection (MTD + today's cost >= $70?)
+  # - Sanity check (> $20/day = wrong instance type)
+  cost-gate:
+    uses: ./.github/workflows/cost-control.yml
+    with:
+      instance_type: t3.large
+      node_count: 2
+    secrets: inherit
 
   deploy:
-    needs: cost-check
+    needs: cost-gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -80,20 +52,15 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # Install tools: eksctl, kubectl, helm
       - name: Install eksctl
         run: |
-          ARCH=amd64
-          PLATFORM=$(uname -s)_$ARCH
-          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$PLATFORM.tar.gz"
-          tar -xzf eksctl_$PLATFORM.tar.gz -C /tmp
-          sudo mv /tmp/eksctl /usr/local/bin
+          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz"
+          tar -xzf eksctl_Linux_amd64.tar.gz -C /tmp && sudo mv /tmp/eksctl /usr/local/bin
 
       - name: Install kubectl
         run: |
           curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
 
       - name: Install Helm
         run: |
@@ -101,19 +68,12 @@ jobs:
 
       # Create EKS cluster from scratch
       # After nightly destroy, no cluster exists. We rebuild each morning.
-      # Takes ~15-20 min. eksctl creates via CloudFormation:
-      #   - VPC with public + private subnets across 2 AZs
-      #   - Internet Gateway + NAT Gateway
-      #   - EKS control plane (managed by AWS)
-      #   - Node group: 2x t3.large EC2 instances
-      #   - IAM roles for control plane and nodes
-      #   - Security groups
       - name: Create EKS cluster
         run: |
           if eksctl get cluster --name $CLUSTER_NAME --region $REGION 2>/dev/null; then
-            echo "Cluster $CLUSTER_NAME already exists, skipping creation"
+            echo "Cluster already exists, skipping creation"
           else
-            echo "Creating cluster from scratch (~15-20 min)..."
+            echo "Creating cluster (~15-20 min)..."
             eksctl create cluster \
               --name $CLUSTER_NAME \
               --region $REGION \
@@ -132,36 +92,49 @@ jobs:
           kubectl get nodes
           kubectl cluster-info
 
-      # Namespace = logical boundary in K8s. Keeps our stuff separate from system stuff.
       - name: Create namespace
         run: |
           kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
 
-      # Helm = K8s package manager. The OTel Demo chart defines all 15 services
-      # + collector + Prometheus + Grafana as K8s resources.
-      # "upgrade --install" = install if not present, upgrade if it is (idempotent)
       - name: Install OTel Demo via Helm
         run: |
           helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
           helm repo update
+
+          # Get the correct values schema for the chart
+          # The frontendProxy component key may vary by chart version
           helm upgrade --install otel-demo open-telemetry/opentelemetry-demo \
             --namespace $NAMESPACE \
-            --set components.frontendProxy.service.type=LoadBalancer \
             --timeout 10m \
             --wait
 
-      # LoadBalancer service type tells K8s to provision an AWS ELB.
-      # This is your stable access point (DNS name, not ephemeral IP).
       - name: Get access URLs
         run: |
-          echo "Waiting for LoadBalancer DNS to be assigned..."
+          echo "Waiting for LoadBalancer DNS..."
           sleep 30
-          FRONTEND_URL=$(kubectl get svc otel-demo-frontendproxy -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-          echo "============================================"
-          echo "  OTel Demo Frontend: http://$FRONTEND_URL:8080"
-          echo "  Grafana:            http://$FRONTEND_URL:8080/grafana/"
-          echo "  Jaeger:             http://$FRONTEND_URL:8080/jaeger/ui"
-          echo "============================================"
+          
+          # Find the frontendproxy service (name may vary by chart version)
+          PROXY_SVC=$(kubectl get svc -n $NAMESPACE -o name | grep -i "frontend-proxy\|frontendproxy" | head -1)
+          
+          if [ -n "$PROXY_SVC" ]; then
+            # Patch it to LoadBalancer type for external access
+            kubectl patch $PROXY_SVC -n $NAMESPACE -p '{"spec": {"type": "LoadBalancer"}}'
+            echo "Patched $PROXY_SVC to LoadBalancer. Waiting for DNS..."
+            sleep 30
+            SVC_NAME=$(echo $PROXY_SVC | sed 's|service/||')
+            FRONTEND_URL=$(kubectl get svc $SVC_NAME -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          fi
+
+          if [ -z "$FRONTEND_URL" ]; then
+            echo "LoadBalancer not assigned yet. Use kubectl port-forward to access:"
+            echo "  kubectl port-forward svc/<frontend-proxy-svc> 8080:8080 -n $NAMESPACE"
+          else
+            echo "============================================"
+            echo "  OTel Demo Frontend: http://$FRONTEND_URL:8080"
+            echo "  Grafana:            http://$FRONTEND_URL:8080/grafana/"
+            echo "  Jaeger:             http://$FRONTEND_URL:8080/jaeger/ui"
+            echo "============================================"
+          fi
 
       - name: Verify deployment
         run: |

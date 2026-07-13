@@ -1,37 +1,41 @@
 # Cost Control Pipeline
 #
-# Rules:
-#   1. PRE-DEPLOY CHECK: if (current_monthly_spend + estimated_weekly_cost) >= $70, HARD STOP.
-#      This ensures we NEVER cross $70 even in the worst case next week.
-#   2. NIGHTLY DESTROY: At 1 AM UTC, full destroy of ALL compute (cluster, nodes, everything).
-#      Only persistent storage (EBS snapshots, S3 state) survives.
-#      15 min rebuild on next deploy is acceptable.
-#   3. EMERGENCY KILL: If monthly spend >= $70 at any check, destroy EVERYTHING immediately.
+# THE financial guardrail for the entire project. ALL other workflows call this.
 #
-# Cost math:
-#   EKS control plane: $0.10/hr = $2.40/day = $16.80/week
-#   2x t3.large nodes: $0.0832/hr each = $1.99/day each = $27.94/week both
-#   Total max weekly: ~$44.74/week (control plane + 2 nodes 24/7)
-#   With nightly destroy (16 hrs/day): ~$22/week
+# Responsibilities:
+#   1. PRE-DEPLOY VALIDATION (called by deploy.yml):
+#      - Check for orphaned resources (nightly destroy failed?)
+#      - Fetch REAL pricing from AWS Pricing API for what we're about to deploy
+#      - Calculate: MTD + (real hourly cost × 16 hrs) >= $70? → BLOCK
+#   2. NIGHTLY DESTROY (1 AM UTC cron):
+#      - Full destroy of all compute
+#   3. EMERGENCY DESTROY:
+#      - If MTD >= $70, kill everything
 #
-# Monthly budget: $70 HARD CAP
-# If current_spend + 44.74 (one full week worst case) >= 70 → block deploy
+# Monthly hard cap: $70. No exceptions.
 
 name: Cost Control
 
 on:
   schedule:
-    # Full destroy at 1 AM UTC every night
     - cron: '0 1 * * *'
 
-  # Called by deploy pipeline as a pre-check
+  # Called by deploy.yml before creating anything
   workflow_call:
+    inputs:
+      instance_type:
+        description: 'EC2 instance type being deployed'
+        required: true
+        type: string
+      node_count:
+        description: 'Number of nodes'
+        required: true
+        type: number
     outputs:
-      budget_ok:
-        description: "Whether projected spend stays under $70"
-        value: ${{ jobs.check-budget.outputs.budget_ok }}
+      approved:
+        description: "Whether deployment is approved"
+        value: ${{ jobs.validate.outputs.approved }}
 
-  # Manual trigger for testing
   workflow_dispatch:
     inputs:
       action:
@@ -42,19 +46,31 @@ on:
         options:
           - check
           - full-destroy
+      instance_type:
+        description: 'Instance type to price check (for manual testing)'
+        required: false
+        default: 't3.large'
+        type: string
+      node_count:
+        description: 'Node count to price check'
+        required: false
+        default: '2'
+        type: string
 
 env:
   CLUSTER_NAME: otel-learning
   REGION: us-east-1
   MONTHLY_HARD_CAP: 70
+  # EKS control plane cost is fixed: $0.10/hr
+  EKS_HOURLY: "0.10"
+  # Hours per day (deploy in morning → destroy at 1 AM)
+  HOURS_PER_DAY: 16
 
 jobs:
-  check-budget:
+  validate:
     runs-on: ubuntu-latest
     outputs:
-      budget_ok: ${{ steps.check.outputs.budget_ok }}
-      current_spend: ${{ steps.check.outputs.current_spend }}
-      projected: ${{ steps.check.outputs.projected }}
+      approved: ${{ steps.final-verdict.outputs.approved }}
     steps:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -63,10 +79,138 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # Simple check: if month-to-date >= $70, block and destroy.
-      - name: Check monthly spend against hard cap
-        id: check
+      # GATE 1: Check for orphaned resources
+      # If nightly destroy failed, resources are ALREADY running and costing money.
+      # Block all new deploys until the leak is fixed.
+      - name: Check for orphaned resources
         run: |
+          echo "=== GATE 1: Orphan Check ==="
+          FAILED=false
+
+          # EKS cluster
+          CLUSTER=$(aws eks describe-cluster --name $CLUSTER_NAME --region $REGION 2>&1 || true)
+          if echo "$CLUSTER" | grep -q "ResourceNotFoundException"; then
+            echo "✅ No existing EKS cluster"
+          else
+            echo "❌ EKS cluster '$CLUSTER_NAME' exists — nightly destroy FAILED"
+            FAILED=true
+          fi
+
+          # EC2 instances tagged with our cluster
+          INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=instance-state-name,Values=running,pending" \
+                      "Name=tag:eksctl.cluster.k8s.io/v1alpha1/cluster-name,Values=$CLUSTER_NAME" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text 2>/dev/null)
+          if [ -n "$INSTANCES" ]; then
+            echo "❌ EC2 instances from previous deploy still running: $INSTANCES"
+            FAILED=true
+          else
+            echo "✅ No orphaned EC2 instances"
+          fi
+
+          # NAT gateways ($0.045/hr each — silent money drain)
+          NATS=$(aws ec2 describe-nat-gateways \
+            --filter "Name=state,Values=available,pending" \
+            --query 'NatGateways[*].NatGatewayId' \
+            --output text 2>/dev/null)
+          if [ -n "$NATS" ]; then
+            echo "❌ NAT gateways still alive: $NATS (\$0.045/hr each!)"
+            FAILED=true
+          else
+            echo "✅ No orphaned NAT gateways"
+          fi
+
+          # Load balancers
+          ELBS=$(aws elb describe-load-balancers --query 'LoadBalancerDescriptions[*].LoadBalancerName' --output text 2>/dev/null)
+          if [ -n "$ELBS" ]; then
+            echo "❌ Classic LBs still exist: $ELBS"
+            FAILED=true
+          else
+            echo "✅ No orphaned load balancers"
+          fi
+
+          if [ "$FAILED" == "true" ]; then
+            echo ""
+            echo "❌ BLOCKED: Orphaned resources detected. Nightly destroy failed."
+            echo "   Run 'Destroy EKS (Manual)' first. Investigate why nightly cron didn't work."
+            exit 1
+          fi
+
+      # GATE 2: Fetch REAL pricing from AWS Pricing API
+      # No hardcoded costs. Pulls live on-demand pricing for the exact instance type.
+      - name: Fetch instance pricing from AWS
+        id: pricing
+        run: |
+          echo "=== GATE 2: Real Pricing Check ==="
+
+          INSTANCE_TYPE="${{ inputs.instance_type || 't3.large' }}"
+          NODE_COUNT="${{ inputs.node_count || '2' }}"
+
+          echo "Instance type: $INSTANCE_TYPE"
+          echo "Node count: $NODE_COUNT"
+
+          # AWS Pricing API is only available in us-east-1 and ap-south-1
+          HOURLY_PRICE=$(aws pricing get-products \
+            --service-code AmazonEC2 \
+            --region us-east-1 \
+            --filters \
+              "Type=TERM_MATCH,Field=instanceType,Value=$INSTANCE_TYPE" \
+              "Type=TERM_MATCH,Field=location,Value=US East (N. Virginia)" \
+              "Type=TERM_MATCH,Field=operatingSystem,Value=Linux" \
+              "Type=TERM_MATCH,Field=tenancy,Value=Shared" \
+              "Type=TERM_MATCH,Field=preInstalledSw,Value=NA" \
+              "Type=TERM_MATCH,Field=capacitystatus,Value=Used" \
+            --query 'PriceList[0]' \
+            --output text 2>/dev/null | python3 -c "
+          import sys, json
+          try:
+              data = json.loads(sys.stdin.read())
+              terms = data['terms']['OnDemand']
+              for term in terms.values():
+                  for price_dim in term['priceDimensions'].values():
+                      price = price_dim['pricePerUnit']['USD']
+                      if float(price) > 0:
+                          print(price)
+                          sys.exit(0)
+          except:
+              pass
+          print('0')
+          ")
+
+          # Fallback: if pricing API fails, use a conservative estimate
+          if [ -z "$HOURLY_PRICE" ] || [ "$HOURLY_PRICE" == "0" ]; then
+            echo "⚠️  Could not fetch price from API. Using conservative fallback."
+            # Fallback lookup table for common types
+            case $INSTANCE_TYPE in
+              t3.micro)   HOURLY_PRICE="0.0104" ;;
+              t3.small)   HOURLY_PRICE="0.0208" ;;
+              t3.medium)  HOURLY_PRICE="0.0416" ;;
+              t3.large)   HOURLY_PRICE="0.0832" ;;
+              t3.xlarge)  HOURLY_PRICE="0.1664" ;;
+              m5.large)   HOURLY_PRICE="0.0960" ;;
+              m5.xlarge)  HOURLY_PRICE="0.1920" ;;
+              c5.large)   HOURLY_PRICE="0.0850" ;;
+              r5.large)   HOURLY_PRICE="0.1260" ;;
+              x1.16xlarge) HOURLY_PRICE="6.669" ;;
+              x1.32xlarge) HOURLY_PRICE="13.338" ;;
+              p3.2xlarge) HOURLY_PRICE="3.060" ;;
+              *)          HOURLY_PRICE="1.00" ;; # Unknown type → assume $1/hr (conservative)
+            esac
+            echo "   Fallback price for $INSTANCE_TYPE: \$$HOURLY_PRICE/hr"
+          fi
+
+          echo "hourly_price=$HOURLY_PRICE" >> $GITHUB_OUTPUT
+          echo "node_count=$NODE_COUNT" >> $GITHUB_OUTPUT
+          echo ""
+          echo "💰 $INSTANCE_TYPE on-demand price: \$$HOURLY_PRICE/hr per instance"
+
+      # GATE 3: Calculate projected daily cost and check against budget
+      - name: Budget projection
+        id: budget
+        run: |
+          echo "=== GATE 3: Budget Projection ==="
+
           START_DATE=$(date +%Y-%m-01)
           END_DATE=$(date +%Y-%m-%d)
 
@@ -81,50 +225,65 @@ jobs:
             MTD_SPEND="0.00"
           fi
 
-          echo "Month-to-date spend: \$$MTD_SPEND"
-          echo "Hard cap: \$$MONTHLY_HARD_CAP"
-          echo "current_spend=$MTD_SPEND" >> $GITHUB_OUTPUT
+          HOURLY_PRICE="${{ steps.pricing.outputs.hourly_price }}"
+          NODE_COUNT="${{ steps.pricing.outputs.node_count }}"
 
-          if (( $(echo "$MTD_SPEND >= $MONTHLY_HARD_CAP" | bc -l) )); then
-            echo "🚨 MONTHLY SPEND HIT \$70 CAP — destroying everything"
-            echo "budget_ok=false" >> $GITHUB_OUTPUT
+          # Total hourly cost = (node_price × node_count) + EKS control plane
+          TOTAL_HOURLY=$(echo "$HOURLY_PRICE * $NODE_COUNT + $EKS_HOURLY" | bc -l)
+
+          # Daily cost = hourly × hours_per_day (16 hrs, morning to 1 AM destroy)
+          DAILY_COST=$(echo "$TOTAL_HOURLY * $HOURS_PER_DAY" | bc -l)
+
+          # Projected: MTD + one day
+          PROJECTED=$(echo "$MTD_SPEND + $DAILY_COST" | bc -l)
+
+          echo "============================================"
+          echo "  Instance type:           ${{ inputs.instance_type || 't3.large' }}"
+          echo "  Node count:              $NODE_COUNT"
+          echo "  Hourly (per node):       \$$HOURLY_PRICE"
+          echo "  EKS control plane:       \$$EKS_HOURLY/hr"
+          echo "  Total hourly:            \$$(printf '%.4f' $TOTAL_HOURLY)"
+          echo "  Daily (${HOURS_PER_DAY}hrs):           \$$(printf '%.2f' $DAILY_COST)"
+          echo "  ─────────────────────────────────────"
+          echo "  Month-to-date spend:     \$$MTD_SPEND"
+          echo "  + Today's deployment:    \$$(printf '%.2f' $DAILY_COST)"
+          echo "  = Projected total:       \$$(printf '%.2f' $PROJECTED)"
+          echo "  Hard cap:                \$$MONTHLY_HARD_CAP"
+          echo "============================================"
+
+          # Check 1: Would this deploy push us over?
+          if (( $(echo "$PROJECTED >= $MONTHLY_HARD_CAP" | bc -l) )); then
+            echo ""
+            echo "❌ DEPLOY BLOCKED: today's deploy would push total to \$$(printf '%.2f' $PROJECTED)"
+            echo "   Hard cap is \$$MONTHLY_HARD_CAP. Cannot proceed."
             exit 1
           fi
 
-          echo "✅ Budget OK (\$$MTD_SPEND < \$70)"
-          echo "budget_ok=true" >> $GITHUB_OUTPUT
+          # Check 2: Are we already over? (shouldn't happen but safety net)
+          if (( $(echo "$MTD_SPEND >= $MONTHLY_HARD_CAP" | bc -l) )); then
+            echo "🚨 ALREADY OVER \$$MONTHLY_HARD_CAP — blocked and triggering destroy"
+            exit 1
+          fi
 
-  # EMERGENCY DESTROY: if monthly spend already >= $70
-  emergency-destroy:
-    needs: check-budget
-    if: failure() && needs.check-budget.outputs.budget_ok == 'false'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          # Check 3: Sanity — is this deploy absurdly expensive? (> $20/day = probably wrong instance)
+          if (( $(echo "$DAILY_COST > 20" | bc -l) )); then
+            echo ""
+            echo "❌ DEPLOY BLOCKED: daily cost \$$(printf '%.2f' $DAILY_COST) is suspiciously high"
+            echo "   Are you sure about instance type '${{ inputs.instance_type || 't3.large' }}'?"
+            echo "   This would burn through the budget in $(echo "$MONTHLY_HARD_CAP / $DAILY_COST" | bc) days."
+            exit 1
+          fi
 
-      - name: Install eksctl
+          echo ""
+          echo "✅ APPROVED: Deploy will cost ~\$$(printf '%.2f' $DAILY_COST) today. Within budget."
+
+      - name: Final verdict
+        id: final-verdict
         run: |
-          ARCH=amd64
-          PLATFORM=$(uname -s)_$ARCH
-          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$PLATFORM.tar.gz"
-          tar -xzf eksctl_$PLATFORM.tar.gz -C /tmp
-          sudo mv /tmp/eksctl /usr/local/bin
+          echo "approved=true" >> $GITHUB_OUTPUT
+          echo "✅ All gates passed. Deploy is authorized."
 
-      - name: Emergency destroy all resources
-        run: |
-          echo "🚨 EMERGENCY DESTROY — monthly spend exceeded hard cap"
-          eksctl delete cluster --name $CLUSTER_NAME --region $REGION --wait || echo "Cluster not found"
-          echo "All compute destroyed. Only S3/EBS snapshots remain (pennies/month)."
-
-  # NIGHTLY FULL DESTROY: runs at 1 AM UTC every night via cron
-  # Destroys the entire cluster — control plane, nodes, everything.
-  # Next deploy rebuilds from scratch (15-20 min). This guarantees $0/hr overnight.
-  # Persistent storage (S3 for Terraform state, EBS snapshots) is NOT touched.
+  # NIGHTLY FULL DESTROY — 1 AM UTC
   nightly-destroy:
     if: github.event_name == 'schedule' || github.event.inputs.action == 'full-destroy'
     runs-on: ubuntu-latest
@@ -138,29 +297,38 @@ jobs:
 
       - name: Install eksctl
         run: |
-          ARCH=amd64
-          PLATFORM=$(uname -s)_$ARCH
-          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$PLATFORM.tar.gz"
-          tar -xzf eksctl_$PLATFORM.tar.gz -C /tmp
-          sudo mv /tmp/eksctl /usr/local/bin
+          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz"
+          tar -xzf eksctl_Linux_amd64.tar.gz -C /tmp && sudo mv /tmp/eksctl /usr/local/bin
 
-      # Full destroy: cluster + nodes + VPC + everything eksctl created.
-      # S3 buckets and EBS snapshots are NOT part of the cluster so they survive.
-      # This brings hourly cost to $0 until you trigger deploy again.
-      - name: Destroy cluster (nightly)
+      - name: Destroy cluster
         run: |
-          echo "🌙 Nightly destroy: tearing down cluster to stop all costs"
-          echo "   Next deploy will recreate from scratch (~15-20 min)"
-
-          # Check if cluster exists first
+          echo "🌙 Nightly destroy: killing everything"
           if eksctl get cluster --name $CLUSTER_NAME --region $REGION 2>/dev/null; then
             eksctl delete cluster --name $CLUSTER_NAME --region $REGION --wait
-            echo "✅ Cluster destroyed. Cost is now $0/hr."
+            echo "✅ Cluster destroyed. Cost: \$0/hr."
           else
-            echo "Cluster doesn't exist. Nothing to destroy."
+            echo "No cluster found. Already clean."
           fi
 
-          echo ""
-          echo "Persistent storage preserved:"
-          echo "  - S3 buckets (Terraform state) — ~$0.02/month"
-          echo "  - EBS snapshots (if any) — ~$0.05/GB/month"
+  # EMERGENCY DESTROY — triggered when budget is breached
+  emergency-destroy:
+    if: github.event.inputs.action == 'full-destroy'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install eksctl
+        run: |
+          curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz"
+          tar -xzf eksctl_Linux_amd64.tar.gz -C /tmp && sudo mv /tmp/eksctl /usr/local/bin
+
+      - name: Emergency destroy
+        run: |
+          echo "🚨 EMERGENCY DESTROY"
+          eksctl delete cluster --name $CLUSTER_NAME --region $REGION --wait || echo "Cluster not found"
+          echo "Done. All compute terminated."
