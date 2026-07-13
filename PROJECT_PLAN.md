@@ -88,7 +88,7 @@ Once in the workspace, set up `.kiro/steering/` with project conventions so Kiro
 
 ## Current Status
 - [x] Milestone 1: Complete (repo scaffolded, IAM users created, secrets stored)
-- [ ] Milestone 2: Not started
+- [x] Milestone 2: Complete (EC2 + Docker Compose running, observability stack live)
 - [ ] Milestone 3: Not started
 - [ ] Milestone 4: Not started
 - [ ] Milestone 5: Not started

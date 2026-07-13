@@ -32,19 +32,38 @@
 └─────────────────────────────────────────────────────────┘
 ```
 
-## Next Milestone (2): EC2 + Docker Compose
+## Milestone 2: EC2 + Docker Compose (CURRENT)
 
 ```
-GitHub ──push──► GitHub Actions ──deploy──► EC2 Instance
-                                              │
-                                    ┌─────────┴─────────┐
-                                    │  Docker Compose    │
-                                    │  - 15 microsvcs   │
-                                    │  - OTel Collector  │
-                                    │  - Prometheus      │
-                                    │  - Grafana         │
-                                    │  - Jaeger          │
-                                    └───────────────────┘
+Internet (your browser)
+    │
+    ├── :8080 → frontend-proxy (Envoy) → web store
+    ├── :3000 → Grafana (dashboards)
+    ├── :9090 → Prometheus (metrics)
+    └── :16686 → Jaeger (traces)
+
+┌─────────────────────────────────────────────────────────┐
+│  EC2: t3.large, 30GB EBS, us-east-1                     │
+│  IAM Role: otel-demo-ec2-role (SSM access)              │
+│  Security Group: otel-demo-sg                           │
+│                                                         │
+│  Docker Compose (3 files merged):                       │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │  15 microservices + load generator                │  │
+│  │       │ OTLP (gRPC :4317)                        │  │
+│  │       ▼                                          │  │
+│  │  OTel Collector                                   │  │
+│  │       ├── metrics → Prometheus                   │  │
+│  │       ├── traces → Jaeger                        │  │
+│  │       └── logs → (OpenSearch, disabled)          │  │
+│  │                                                  │  │
+│  │  Grafana ← queries Prometheus + Jaeger           │  │
+│  └───────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
 ```
+
+## Next Milestone (3): Explore Prometheus, Grafana, Traces
+
+Deep dive into the running observability stack — PromQL, Grafana dashboards, distributed tracing.
 
 *Updated each milestone. Previous states preserved in git history.*
