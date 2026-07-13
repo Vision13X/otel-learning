@@ -15,9 +15,9 @@ name: Validate Destroy (Verify $0 Cost)
 
 on:
   workflow_dispatch:  # Manual trigger
-  # Also run automatically 30 min after nightly destroy
+  # Also run automatically 30 min after nightly destroy (1:30 AM IST = 20:00 UTC)
   schedule:
-    - cron: '30 1 * * *'
+    - cron: '0 20 * * *'
 
 env:
   CLUSTER_NAME: otel-learning
