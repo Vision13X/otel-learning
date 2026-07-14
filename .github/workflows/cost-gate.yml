@@ -1,0 +1,191 @@
+# Cost Gate — Reusable validation workflow called by deploy.yml
+#
+# This exists separately from cost-control.yml because GitHub Actions
+# does not allow a workflow with 'schedule' trigger to also be 'workflow_call'.
+#
+# Contains the same validation logic as cost-control.yml's validate job:
+#   Gate 1: Orphan check (nightly destroy failed?)
+#   Gate 2: AWS Pricing API (real $/hr for instance type)
+#   Gate 3: Budget projection (MTD + daily cost >= $70?)
+#   Gate 4: Sanity check (> $20/day = wrong instance)
+
+name: Cost Gate (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      instance_type:
+        description: 'EC2 instance type being deployed'
+        required: true
+        type: string
+      node_count:
+        description: 'Number of nodes'
+        required: true
+        type: number
+    outputs:
+      approved:
+        description: "Whether deployment is approved"
+        value: ${{ jobs.validate.outputs.approved }}
+
+env:
+  CLUSTER_NAME: otel-learning
+  REGION: us-east-1
+  MONTHLY_HARD_CAP: 70
+  EKS_HOURLY: "0.10"
+  HOURS_PER_DAY: 16
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      approved: ${{ steps.final-verdict.outputs.approved }}
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # GATE 1: Orphan check
+      - name: Check for orphaned resources
+        run: |
+          echo "=== GATE 1: Orphan Check ==="
+          FAILED=false
+
+          CLUSTER=$(aws eks describe-cluster --name $CLUSTER_NAME --region $REGION 2>&1 || true)
+          if echo "$CLUSTER" | grep -q "ResourceNotFoundException"; then
+            echo "✅ No existing EKS cluster"
+          else
+            echo "❌ EKS cluster '$CLUSTER_NAME' exists — nightly destroy FAILED"
+            FAILED=true
+          fi
+
+          INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=instance-state-name,Values=running,pending" \
+                      "Name=tag:eksctl.cluster.k8s.io/v1alpha1/cluster-name,Values=$CLUSTER_NAME" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text 2>/dev/null)
+          if [ -n "$INSTANCES" ]; then
+            echo "❌ EC2 instances still running: $INSTANCES"
+            FAILED=true
+          else
+            echo "✅ No orphaned EC2 instances"
+          fi
+
+          NATS=$(aws ec2 describe-nat-gateways \
+            --filter "Name=state,Values=available,pending" \
+            --query 'NatGateways[*].NatGatewayId' \
+            --output text 2>/dev/null)
+          if [ -n "$NATS" ]; then
+            echo "❌ NAT gateways still alive: $NATS"
+            FAILED=true
+          else
+            echo "✅ No orphaned NAT gateways"
+          fi
+
+          if [ "$FAILED" == "true" ]; then
+            echo "❌ BLOCKED: Orphaned resources. Run manual destroy first."
+            exit 1
+          fi
+
+      # GATE 2: Fetch real pricing
+      - name: Fetch instance pricing
+        id: pricing
+        run: |
+          echo "=== GATE 2: Pricing ==="
+          INSTANCE_TYPE="${{ inputs.instance_type }}"
+          NODE_COUNT="${{ inputs.node_count }}"
+
+          # Try AWS Pricing API (only in us-east-1)
+          HOURLY_PRICE=$(aws pricing get-products \
+            --service-code AmazonEC2 \
+            --region us-east-1 \
+            --filters \
+              "Type=TERM_MATCH,Field=instanceType,Value=$INSTANCE_TYPE" \
+              "Type=TERM_MATCH,Field=location,Value=US East (N. Virginia)" \
+              "Type=TERM_MATCH,Field=operatingSystem,Value=Linux" \
+              "Type=TERM_MATCH,Field=tenancy,Value=Shared" \
+              "Type=TERM_MATCH,Field=preInstalledSw,Value=NA" \
+              "Type=TERM_MATCH,Field=capacitystatus,Value=Used" \
+            --query 'PriceList[0]' \
+            --output text 2>/dev/null | python3 -c "
+          import sys, json
+          try:
+              data = json.loads(sys.stdin.read())
+              terms = data['terms']['OnDemand']
+              for term in terms.values():
+                  for price_dim in term['priceDimensions'].values():
+                      price = price_dim['pricePerUnit']['USD']
+                      if float(price) > 0:
+                          print(price)
+                          sys.exit(0)
+          except:
+              pass
+          print('0')
+          ")
+
+          # Fallback if API fails
+          if [ -z "$HOURLY_PRICE" ] || [ "$HOURLY_PRICE" == "0" ]; then
+            echo "⚠️  Pricing API failed. Using fallback."
+            case $INSTANCE_TYPE in
+              t3.micro)    HOURLY_PRICE="0.0104" ;;
+              t3.small)    HOURLY_PRICE="0.0208" ;;
+              t3.medium)   HOURLY_PRICE="0.0416" ;;
+              t3.large)    HOURLY_PRICE="0.0832" ;;
+              t3.xlarge)   HOURLY_PRICE="0.1664" ;;
+              m5.large)    HOURLY_PRICE="0.0960" ;;
+              m5.xlarge)   HOURLY_PRICE="0.1920" ;;
+              *)           HOURLY_PRICE="1.00" ;;
+            esac
+          fi
+
+          echo "💰 $INSTANCE_TYPE: \$$HOURLY_PRICE/hr"
+          echo "hourly_price=$HOURLY_PRICE" >> $GITHUB_OUTPUT
+          echo "node_count=$NODE_COUNT" >> $GITHUB_OUTPUT
+
+      # GATE 3: Budget projection
+      - name: Budget check
+        run: |
+          echo "=== GATE 3: Budget ==="
+          START_DATE=$(date +%Y-%m-01)
+          END_DATE=$(date +%Y-%m-%d)
+
+          MTD_SPEND=$(aws ce get-cost-and-usage \
+            --time-period Start=$START_DATE,End=$END_DATE \
+            --granularity MONTHLY \
+            --metrics UnblendedCost \
+            --query 'ResultsByTime[0].Total.UnblendedCost.Amount' \
+            --output text)
+
+          if [ -z "$MTD_SPEND" ] || [ "$MTD_SPEND" == "None" ]; then
+            MTD_SPEND="0.00"
+          fi
+
+          HOURLY_PRICE="${{ steps.pricing.outputs.hourly_price }}"
+          NODE_COUNT="${{ steps.pricing.outputs.node_count }}"
+          TOTAL_HOURLY=$(echo "$HOURLY_PRICE * $NODE_COUNT + $EKS_HOURLY" | bc -l)
+          DAILY_COST=$(echo "$TOTAL_HOURLY * $HOURS_PER_DAY" | bc -l)
+          PROJECTED=$(echo "$MTD_SPEND + $DAILY_COST" | bc -l)
+
+          echo "  MTD spend:        \$$MTD_SPEND"
+          echo "  Today's cost:     \$$(printf '%.2f' $DAILY_COST)"
+          echo "  Projected total:  \$$(printf '%.2f' $PROJECTED)"
+          echo "  Hard cap:         \$$MONTHLY_HARD_CAP"
+
+          if (( $(echo "$PROJECTED >= $MONTHLY_HARD_CAP" | bc -l) )); then
+            echo "❌ BLOCKED: \$$(printf '%.2f' $PROJECTED) would breach \$$MONTHLY_HARD_CAP"
+            exit 1
+          fi
+
+          if (( $(echo "$DAILY_COST > 20" | bc -l) )); then
+            echo "❌ BLOCKED: \$$(printf '%.2f' $DAILY_COST)/day is suspiciously high for ${{ inputs.instance_type }}"
+            exit 1
+          fi
+
+          echo "✅ APPROVED"
+
+      - name: Final verdict
+        id: final-verdict
+        run: |
+          echo "approved=true" >> $GITHUB_OUTPUT

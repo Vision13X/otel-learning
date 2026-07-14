@@ -32,7 +32,7 @@ jobs:
   # - Budget projection (MTD + today's cost >= $70?)
   # - Sanity check (> $20/day = wrong instance type)
   cost-gate:
-    uses: ./.github/workflows/cost-control.yml
+    uses: ./.github/workflows/cost-gate.yml
     with:
       instance_type: t3.large
       node_count: 2
