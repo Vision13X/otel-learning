@@ -18,7 +18,7 @@ inclusion: auto
 - Instance type: t3.large
 - Node count: 2
 - Cluster creator: kiro-deploy (via GitHub Actions)
-- CloudShell user access: NOT YET GRANTED — needs deploy pipeline to run grant step
+- CloudShell user access: GRANTED (access entry + AmazonEKSClusterAdminPolicy)
 
 ## GitHub
 - Username: Vision13X
@@ -34,3 +34,6 @@ inclusion: auto
 - If a value is marked UNKNOWN, ASK the user before proceeding
 - If deploying a pipeline step that references a specific resource, parameterize it
 - Use GitHub Secrets or workflow inputs for anything environment-specific
+- ALWAYS mark milestones as complete and write milestone notes when boundary is crossed
+- Detect milestone completion by: user says "done", "next", or moves to new topic
+- When marking a milestone complete: update PROJECT_PLAN.md status + create docs/milestones/XX-*.md

@@ -90,14 +90,13 @@ Once in the workspace, set up `.kiro/steering/` with project conventions so Kiro
 - [x] Milestone 1: Complete (repo scaffolded, IAM users created, secrets stored)
 - [x] Milestone 2: Complete (EC2 + Docker Compose running, observability stack live)
 - [x] Milestone 3: Complete (Prometheus, Grafana, Jaeger, tracing, dashboard design, instrumentation)
-- [x] Milestone 4: In Progress (EKS deploy + destroy pipelines written)
-- [ ] Milestone 4: Not started
-- [ ] Milestone 5: Not started
-- [ ] Milestone 6: Not started
-- [ ] Milestone 7: Not started
-- [ ] Milestone 8: Not started
-- [ ] Milestone 9: Not started
-- [ ] Milestone 10: Not started
+- [x] Milestone 4: Complete (GitHub Actions: deploy, destroy, cost-gate, validate, lifecycle test)
+- [ ] Milestone 5: In Progress (EKS cluster running, OTel Demo deployed, exploring K8s)
+- [ ] Milestone 6: SKIPPED (Terraform — out of scope, no time before interview)
+- [x] Milestone 7: Complete (Cost control: budget gate, nightly destroy, orphan check, pricing API)
+- [ ] Milestone 8: Not started (CloudWatch monitoring — next after Milestone 5)
+- [ ] Milestone 9: DEFERRED (post-interview)
+- [ ] Milestone 10: DEFERRED (post-interview)
 
 ## Next Action
-Start Milestone 2: Launch EC2 instance, install Docker, deploy OTel Demo via Docker Compose.
+Complete Milestone 5 (K8s exploration), then Milestone 8 (CloudWatch observability of observability).
