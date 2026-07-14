@@ -1,0 +1,47 @@
+# Grant vision-admin access to EKS cluster
+# Standalone workflow — no cost gate, no deploy logic.
+# Run this once after cluster creation.
+
+name: Grant Cluster Access
+
+on:
+  workflow_dispatch:
+
+env:
+  CLUSTER_NAME: otel-learning
+  REGION: us-east-1
+
+jobs:
+  grant:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region $REGION
+
+      - name: Grant vision-admin access
+        run: |
+          aws eks create-access-entry \
+            --cluster-name $CLUSTER_NAME \
+            --principal-arn arn:aws:iam::835050295936:user/vision-admin \
+            --type STANDARD \
+            --region $REGION 2>/dev/null || echo "Access entry already exists"
+
+          aws eks associate-access-policy \
+            --cluster-name $CLUSTER_NAME \
+            --principal-arn arn:aws:iam::835050295936:user/vision-admin \
+            --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+            --access-scope type=cluster \
+            --region $REGION 2>/dev/null || echo "Policy already associated"
+
+          echo "✅ vision-admin now has cluster admin access"
+          echo "   Run in CloudShell:"
+          echo "   aws eks update-kubeconfig --name otel-learning --region us-east-1"
+          echo "   kubectl get nodes"
